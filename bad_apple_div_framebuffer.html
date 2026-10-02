@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bad Apple!! — DOM DIV Framebuffer</title>
+<style>
+  :root {
+    --cols: 160;
+    --rows: 120;
+    --pixel: 4px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: #111;
+    color: #eee;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 18px;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 700;
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    justify-content: center;
+  }
+
+  button, select, input {
+    font: inherit;
+  }
+
+  button {
+    padding: 7px 10px;
+    cursor: pointer;
+  }
+
+  .stats {
+    font-size: 12px;
+    opacity: .85;
+    white-space: pre-wrap;
+    text-align: center;
+  }
+
+  #screenWrap {
+    max-width: 95vw;
+    overflow: auto;
+    border: 1px solid #444;
+    background: #000;
+    padding: 8px;
+  }
+
+  #screen {
+    display: grid;
+    grid-template-columns: repeat(var(--cols), var(--pixel));
+    grid-template-rows: repeat(var(--rows), var(--pixel));
+    width: calc(var(--cols) * var(--pixel));
+    height: calc(var(--rows) * var(--pixel));
+    background: #000;
+    contain: layout paint size style;
+  }
+
+  .px {
+    width: var(--pixel);
+    height: var(--pixel);
+    background: #000;
+  }
+
+  .px.on {
+    background: #fff;
+  }
+
+  /*
+    Keep the video alive for decoding/audio, but do not use it as the visible display.
+    The DOM grid above is the actual "screen".
+  */
+  #sourceVideo {
+    position: fixed;
+    left: -9999px;
+    top: -9999px;
+    width: 1px;
+    height: 1px;
+    opacity: 0.001;
+    pointer-events: none;
+  }
+
+  #sampler {
+    display: none;
+  }
+
+  .warning {
+    max-width: 900px;
+    font-size: 12px;
+    opacity: .75;
+    line-height: 1.45;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>Bad Apple!! but the DOM is the framebuffer</h1>
+
+<div class="controls">
+  <input id="fileInput" type="file" accept="video/mp4,video/webm,video/*">
+
+  <label>
+    Resolution:
+    <select id="resolution">
+      <option value="64x48">64×48 — 3,072 divs</option>
+      <option value="96x72">96×72 — 6,912 divs</option>
+      <option value="128x96">128×96 — 12,288 divs</option>
+      <option value="160x120" selected>160×120 — 19,200 divs</option>
+      <option value="192x144">192×144 — 27,648 divs</option>
+    </select>
+  </label>
+
+  <label>
+    Threshold:
+    <input id="threshold" type="range" min="0" max="255" value="127">
+    <span id="thresholdValue">127</span>
+  </label>
+
+  <label>
+    Pixel size:
+    <select id="pixelSize">
+      <option value="2">2 px</option>
+      <option value="3">3 px</option>
+      <option value="4" selected>4 px</option>
+      <option value="5">5 px</option>
+      <option value="6">6 px</option>
+    </select>
+  </label>
+
+  <button id="startBtn">Start / Resume</button>
+  <button id="pauseBtn">Pause</button>
+</div>
+
+<div class="stats" id="stats">Choose a video file. Chrome will decode it; thousands of DIVs will suffer.</div>
+
+<div id="screenWrap">
+  <div id="screen"></div>
+</div>
+
+<video id="sourceVideo" playsinline></video>
+<canvas id="sampler"></canvas>
+
+<div class="warning">
+  This intentionally uses thousands of HTML DIV elements as binary pixels.
+  Chrome still decodes the video normally; a hidden canvas samples each decoded frame,
+  then JavaScript updates the DOM pixel-by-pixel. 160×120 means 19,200 elements per frame.
+  If the tab becomes sluggish, lower the resolution.
+</div>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('fileInput');
+  const resolution = document.getElementById('resolution');
+  const threshold = document.getElementById('threshold');
+  const thresholdValue = document.getElementById('thresholdValue');
+  const pixelSize = document.getElementById('pixelSize');
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const stats = document.getElementById('stats');
+  const screen = document.getElementById('screen');
+  const video = document.getElementById('sourceVideo');
+  const canvas = document.getElementById('sampler');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  let cols = 160;
+  let rows = 120;
+  let pixels = [];
+  let objectUrl = null;
+  let renderedFrames = 0;
+  let lastStatsTime = performance.now();
+  let loopToken = 0;
+
+  function parseResolution() {
+    const [w, h] = resolution.value.split('x').map(Number);
+    cols = w;
+    rows = h;
+  }
+
+  function rebuildGrid() {
+    loopToken++;
+    parseResolution();
+
+    document.documentElement.style.setProperty('--cols', cols);
+    document.documentElement.style.setProperty('--rows', rows);
+    document.documentElement.style.setProperty('--pixel', `${pixelSize.value}px`);
+
+    canvas.width = cols;
+    canvas.height = rows;
+
+    screen.replaceChildren();
+
+    const frag = document.createDocumentFragment();
+    pixels = new Array(cols * rows);
+
+    for (let i = 0; i < pixels.length; i++) {
+      const el = document.createElement('div');
+      el.className = 'px';
+      frag.appendChild(el);
+      pixels[i] = el;
+    }
+
+    screen.appendChild(frag);
+    renderedFrames = 0;
+    lastStatsTime = performance.now();
+
+    stats.textContent =
+      `Framebuffer rebuilt: ${cols}×${rows} = ${pixels.length.toLocaleString()} DIV pixels`;
+  }
+
+  function renderFrame() {
+    if (video.paused || video.ended) return;
+
+    ctx.drawImage(video, 0, 0, cols, rows);
+    const rgba = ctx.getImageData(0, 0, cols, rows).data;
+    const t = Number(threshold.value);
+
+    // One DOM element per pixel. This is the cursed bit.
+    for (let p = 0, i = 0; p < pixels.length; p++, i += 4) {
+      const y =
+        0.299 * rgba[i] +
+        0.587 * rgba[i + 1] +
+        0.114 * rgba[i + 2];
+
+      pixels[p].classList.toggle('on', y >= t);
+    }
+
+    renderedFrames++;
+
+    const now = performance.now();
+    if (now - lastStatsTime >= 1000) {
+      const seconds = (now - lastStatsTime) / 1000;
+      const fps = renderedFrames / seconds;
+
+      stats.textContent =
+        `${cols}×${rows} | ${pixels.length.toLocaleString()} DIVs | ` +
+        `${fps.toFixed(1)} DOM frames/s | video ${video.currentTime.toFixed(2)}s`;
+
+      renderedFrames = 0;
+      lastStatsTime = now;
+    }
+  }
+
+  function scheduleWithVideoFrameCallback(token) {
+    if (token !== loopToken) return;
+    if (video.paused || video.ended) return;
+
+    renderFrame();
+
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      video.requestVideoFrameCallback(() => scheduleWithVideoFrameCallback(token));
+    } else {
+      requestAnimationFrame(() => scheduleWithVideoFrameCallback(token));
+    }
+  }
+
+  async function start() {
+    if (!video.src) {
+      alert('Choose a local video first.');
+      return;
+    }
+
+    try {
+      await video.play();
+    } catch (err) {
+      console.error(err);
+      alert('Chrome blocked playback. Click Start again.');
+      return;
+    }
+
+    const token = ++loopToken;
+
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      video.requestVideoFrameCallback(() => scheduleWithVideoFrameCallback(token));
+    } else {
+      requestAnimationFrame(() => scheduleWithVideoFrameCallback(token));
+    }
+  }
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = URL.createObjectURL(file);
+
+    video.src = objectUrl;
+    video.load();
+
+    stats.textContent =
+      `Loaded ${file.name}. Click Start / Resume. ` +
+      `Audio comes from the hidden video; pixels come from ${pixels.length.toLocaleString()} DIVs.`;
+  });
+
+  resolution.addEventListener('change', rebuildGrid);
+
+  pixelSize.addEventListener('change', () => {
+    document.documentElement.style.setProperty('--pixel', `${pixelSize.value}px`);
+  });
+
+  threshold.addEventListener('input', () => {
+    thresholdValue.textContent = threshold.value;
+  });
+
+  startBtn.addEventListener('click', start);
+
+  pauseBtn.addEventListener('click', () => {
+    video.pause();
+    loopToken++;
+  });
+
+  video.addEventListener('ended', () => {
+    stats.textContent += ' | ended';
+  });
+
+  rebuildGrid();
+})();
+</script>
+</body>
+</html>
